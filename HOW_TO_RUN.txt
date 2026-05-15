@@ -1,123 +1,323 @@
 HOW TO RUN — AsymFlow Audio
 ============================
 
-PAPER: arxiv.org/abs/2605.12964v1 (AsymFlow, Chen et al. 2026)
-GOAL:  Port rank-asymmetric flow matching to raw audio (SC09 speech dataset)
-HARDWARE: Single GPU, 40GB+ VRAM recommended (H100/A100)
+PAPER:    arxiv.org/abs/2605.12964v1  (AsymFlow, Chen et al. 2026)
+REPO:     github.com/US30/asymflow-audio
+GOAL:     Port rank-asymmetric flow matching to speech — prove it works on
+          mel-spectrograms, explain why raw waveforms are harder, show it
+          generalises to LJSpeech.
+HARDWARE: Single GPU, 40GB+ VRAM (H100/A100). bf16 training.
 
 
-1. INSTALL
-----------
-pip install -e ".[dev]"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK START (run these in order, every time)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  pip install -e ".[dev]"       # 1. install
+  make data                     # 2. SC09 dataset
+  make data-lj                  # 3. LJSpeech dataset
+  make hifigan                  # 4. pretrained vocoder
+  wandb login                   # 5. W&B (or: export WANDB_MODE=disabled)
+  make analyze                  # 6. Phase 0 — MUST run, read output first
+  make test                     # 7. sanity tests — all must pass
 
 
-2. DATA
--------
-make data
-  → Downloads Speech Commands v0.02 (~2.4 GB) into data/sc09/
-  → Extracts digit classes: zero one two three four five six seven eight nine
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 0 — VARIANCE ANALYSIS  (~10 min, CPU)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-OR manually:
-  bash scripts/download_sc09.sh data/sc09
+  make analyze
 
+  Computes PCA explained-variance over patches from:
+    - SC09 raw waveform  (patch=64)
+    - SC09 mel-spec      (80 mel × 8 frames = 640-dim)
+    - LJSpeech mel-spec  (same)
 
-3. SANITY TESTS (run before training)
---------------------------------------
-make test
-  → Tests projector idempotency, symmetry, full-rank equivalence
-  → Tests that AsymFM loss == standard FM when rank == patch_size (64)
-  → Tests velocity recovery shape and correctness
-  → All tests must pass before training
+  Output:  results/variance_explained.png
+           results/variance_explained.csv
 
+  READ THIS PLOT BEFORE TRAINING.
+  It tells you:
+    - Where the asym trick is predicted to win (steep curve = low-rank)
+    - What rank to use (elbow of curve ≈ optimal rank_freq / rank_time)
+    - If curve is flat for raw waveform → expected marginal result in Phase 1
 
-4. TRAIN BASELINE (standard flow matching)
--------------------------------------------
-make train-fm
-  OR: python -m asymflow_audio.train configs/base_fm.yaml
-
-Config: configs/base_fm.yaml
-  - 100k steps, batch 128, bf16, AdamW lr=1e-4
-  - 1D DiT-S/64, ~33M params
-Checkpoints saved to: runs/base_fm/
-Samples saved to:     runs/base_fm/samples/
-Logs to W&B project:  asymflow-audio
+  Configs already set rank_freq=4, rank_time=4 (rank=16 out of 640).
+  If your elbow differs, edit:
+    configs/asym_dct_sc09_mel.yaml  →  rank_freq, rank_time
+    configs/asym_dct_lj_mel.yaml    →  rank_freq, rank_time
 
 
-5. TRAIN ASYMFLOW (rank-asymmetric, DCT projector)
-----------------------------------------------------
-make train-asym
-  OR: python -m asymflow_audio.train configs/asym_dct.yaml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TESTS  (run before every experiment)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Config: configs/asym_dct.yaml
-  - Same arch as baseline, rank=8 DCT projector
-  - Velocity target: u_A = P·ε − x₀  (P = DCT-II truncation, r=8)
-Checkpoints saved to: runs/asym_dct/
+  make test
 
+  Covers:
+    1D DCT projector  — idempotency, symmetry, full-rank = identity
+    2D DCT projector  — same, plus Kronecker construction
+    Loss equivalence  — AsymFM with r=D must equal standard FM exactly
+    Velocity recovery — shape + full-rank identity
+    Synthetic check   — no NaN/Inf on sinusoid input
 
-5a. TRAIN ASYMFLOW with PCA projector (optional)
--------------------------------------------------
-python scripts/compute_pca_basis.py \
-    --data_root data/sc09 --rank 8 --out data/sc09_pca_basis.pt
-
-python -m asymflow_audio.train configs/asym_pca.yaml
+  ALL TESTS MUST PASS. If any fail, do not train.
 
 
-6. EVALUATE (FAD score)
-------------------------
-First prepare reference WAVs from SC09 test split:
-  mkdir -p data/sc09/test_wavs
-  # copy .wav files from data/sc09/*/  (val split) into test_wavs/
-  # OR any ~2k SC09 wavs as reference
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — SC09 RAW WAVEFORM  (~24 GPU-hrs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Then evaluate:
-  python -m asymflow_audio.eval \
-      --ckpt runs/asym_dct/ckpt_0100000.pt \
-      --cfg configs/asym_dct.yaml \
-      --ref_dir data/sc09/test_wavs \
-      --out_dir results/asym_dct \
-      --n_samples 2048
+  Serves as the "expected-fail" condition and raw-waveform ablation.
+  Prediction: asym FM ties or marginally beats baseline.
 
-  FAD score written to: results/asym_dct/fad.json
-  Compare against:      runs/base_fm/  (same eval command, different --ckpt/--cfg)
+  make train-fm          # 100k steps, batch 128, bf16  (~12 hrs)
+  make train-asym        # same, DCT r=8                (~12 hrs)
+  make ablation          # rank sweep r={2,4,8,16,32,48} 50k steps each (~24 hrs)
 
+  Configs:
+    configs/base_fm.yaml          patch=64, DiT-S/64
+    configs/asym_dct.yaml         patch=64, DCT r=8
+    configs/asym_pca.yaml         patch=64, PCA r=8 (optional)
 
-7. RANK ABLATION
------------------
-make ablation
-  OR: python scripts/rank_ablation.py \
-          --ref_dir data/sc09/test_wavs \
-          --steps 50000 \
-          --ranks 2,4,8,16,32,48
+  Evaluate:
+    mkdir -p data/sc09/test_wavs
+    # copy ~2k SC09 wavs (val split) into test_wavs/
 
-Trains 6 models at reduced steps, computes FAD per rank.
-Output: results/rank_ablation.csv
-        results/rank_ablation.png
+    python -m asymflow_audio.eval \
+        --ckpt runs/base_fm/ckpt_0100000.pt \
+        --cfg  configs/base_fm.yaml \
+        --ref_dir data/sc09/test_wavs \
+        --out_dir results/base_fm \
+        --n_samples 2048
 
+    python -m asymflow_audio.eval \
+        --ckpt runs/asym_dct/ckpt_0100000.pt \
+        --cfg  configs/asym_dct.yaml \
+        --ref_dir data/sc09/test_wavs \
+        --out_dir results/asym_dct \
+        --n_samples 2048
 
-EXPECTED RUNTIME (H100 40GB)
-------------------------------
-100k steps, batch 128, bf16:  ~8–12 hours per run
-Rank ablation (6 × 50k steps): ~24–36 hours total
-FAD eval (2048 samples):        ~10 minutes
+    FAD written to results/<name>/fad.json
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — SC09 MEL-SPECTROGRAM  (~16 GPU-hrs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PRIMARY EXPERIMENT. Mel-spec patches are demonstrably low-rank →
+  asym trick predicted to win clearly here.
+
+  Mel pipeline: 80 mel bins, hop=160, win=320 → ~100 frames/clip
+  Patch: 80 mel × 8 time = 640-dim → 12 tokens per 1-sec clip
+  Projector: 2D DCT (Kronecker), rank_freq=4, rank_time=4 → rank=16/640
+  Vocoder: HiFi-GAN UNIVERSAL_V1 for mel→audio (FAD eval)
+
+  make train-fm-mel      # (~8 hrs)
+  make train-asym-mel    # (~8 hrs)
+
+  Configs:
+    configs/base_fm_sc09_mel.yaml         patch=640, DiT-S
+    configs/asym_dct_sc09_mel.yaml        patch=640, DCT2D rank=16
+
+  Evaluate:
+    # For mel models, ref audio ALSO goes through vocoder round-trip
+    # so vocoder quality floor cancels — fair comparison.
+
+    python -m asymflow_audio.eval \
+        --ckpt runs/base_fm_sc09_mel/ckpt_0100000.pt \
+        --cfg  configs/base_fm_sc09_mel.yaml \
+        --ref_dir data/sc09/test_wavs \
+        --out_dir results/base_fm_sc09_mel \
+        --n_samples 2048
+
+    python -m asymflow_audio.eval \
+        --ckpt runs/asym_dct_sc09_mel/ckpt_0100000.pt \
+        --cfg  configs/asym_dct_sc09_mel.yaml \
+        --ref_dir data/sc09/test_wavs \
+        --out_dir results/asym_dct_sc09_mel \
+        --n_samples 2048
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — LJSPEECH MEL-SPEC  (~40 GPU-hrs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Generalization check. 13k clips, 24hrs single speaker.
+  Same mel pipeline as Phase 2. 2-sec random crops → 25 tokens per sample.
+  200k training steps (larger dataset → longer).
+
+  make train-fm-lj       # (~20 hrs)
+  make train-asym-lj     # (~20 hrs)
+
+  Configs:
+    configs/base_fm_lj_mel.yaml           200k steps
+    configs/asym_dct_lj_mel.yaml          200k steps
+
+  Evaluate:
+    mkdir -p data/ljspeech/test_wavs
+    # copy ~2k LJSpeech wavs into test_wavs/
+
+    python -m asymflow_audio.eval \
+        --ckpt runs/base_fm_lj_mel/ckpt_0200000.pt \
+        --cfg  configs/base_fm_lj_mel.yaml \
+        --ref_dir data/ljspeech/test_wavs \
+        --out_dir results/base_fm_lj \
+        --n_samples 2048
+
+    python -m asymflow_audio.eval \
+        --ckpt runs/asym_dct_lj_mel/ckpt_0200000.pt \
+        --cfg  configs/asym_dct_lj_mel.yaml \
+        --ref_dir data/ljspeech/test_wavs \
+        --out_dir results/asym_dct_lj \
+        --n_samples 2048
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — DIT-B SCALE CHECK  (~20 GPU-hrs)  [STRETCH]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Only run if Phase 3 shows clean improvement.
+  Tests whether asym FM benefit grows with model scale.
+
+  make train-asym-lj-b
+
+  Config:
+    configs/asym_dct_lj_mel_b.yaml    dim=768, heads=12, ~130M params
+                                       batch=64, grad_accum=2 (eff. 128)
+
+  Compare DiT-B asym vs DiT-S asym (Phase 3) — gap should widen.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXPECTED RUNTIMES (H100 40GB, bf16)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Phase 0  variance analysis (CPU)          < 30 min
+  Phase 1  SC09 raw: FM + asym + ablation   ~24 hrs
+  Phase 2  SC09 mel: FM + asym              ~16 hrs
+  Phase 3  LJSpeech mel: FM + asym          ~40 hrs
+  Phase 4  DiT-B (stretch)                  ~20 hrs
+  FAD eval (2048 samples, any model)        ~10 min
+  ─────────────────────────────────────────────────
+  TOTAL (all phases)                        ~100 hrs  (~3 weeks calendar)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESULTS TABLE  (fill in after each eval)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Dataset     Domain        Model   FM FAD   AsymFM FAD   Δ
+  ─────────── ────────────  ──────  ───────  ──────────── ────
+  SC09        raw waveform  DiT-S   ___      ___          ___
+  SC09        mel-spec      DiT-S   ___      ___          ___
+  LJSpeech    mel-spec      DiT-S   ___      ___          ___
+  LJSpeech    mel-spec      DiT-B   ___      ___          ___
+
+  Reference (literature):
+    DiffWave on SC09 raw:    FAD ≈ 1.3
+    PriorGrad on SC09 raw:   FAD ≈ 0.5
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WANDB
-------
-Login first: wandb login
-All runs log to project: asymflow-audio
-Disable: set WANDB_MODE=disabled in env
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Login:    wandb login
+  Project:  asymflow-audio  (auto-created on first run)
+  Disable:  export WANDB_MODE=disabled
+
+  Each run logs: loss curve, LR schedule, audio samples every 5k steps.
+  Audio samples: runs/<name>/samples/step_XXXXXXX/*.wav
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHECKPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Saved every 10k steps (Phase 1/2) or 20k steps (Phase 3/4):
+    runs/<config_name>/ckpt_XXXXXXX.pt
+
+  Contains keys: step, model, ema, opt
+  Eval script uses 'ema' key by default (--use_ema flag, on by default).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HiFi-GAN FALLBACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  If make hifigan fails (Google Drive download may be blocked):
+
+  1. Go to: github.com/jik876/hifi-gan#pretrained-model
+  2. Download UNIVERSAL_V1 manually
+  3. Place files as:
+       data/hifigan/generator_universal.pth
+       data/hifigan/config_v1.json
+  4. Clone repo: git clone https://github.com/jik876/hifi-gan third_party/hifigan
+
+  If weights still unavailable: code falls back to Griffin-Lim automatically.
+  Griffin-Lim = lower audio quality but FAD comparison still valid
+  (both generated and reference go through same fallback).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FILE LAYOUT
------------
-src/asymflow_audio/
-  data/sc09.py       — SC09 dataset loader, µ-law normalization
-  model/dit1d.py     — 1D DiT-S/64 with AdaLN-zero conditioning
-  flow/projector.py  — DCT + PCA rank-r projectors
-  flow/loss.py       — standard FM and asymmetric FM loss
-  flow/sampler.py    — 50-step Euler ODE sampler
-  train.py           — training loop
-  eval.py            — FAD evaluation
-configs/             — YAML hyperparams per experiment
-scripts/             — download, PCA precompute, rank sweep
-tests/               — correctness unit tests
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  src/asymflow_audio/
+    data/sc09.py        SC09 raw waveform loader, µ-law encode/decode
+    data/melspec.py     MelSpec extraction, normalization, HiFi-GAN wrapper
+    data/sc09_mel.py    SC09 mel-spec dataset → (12, 640) tokens
+    data/ljspeech.py    LJSpeech raw + mel-spec datasets → (25, 640) tokens
+    model/dit1d.py      1D DiT: TimestepEmbedder, DiTBlock, AdaLN-zero
+    flow/projector.py   DCTProjector (1D), DCT2DProjector (mel), PCAProjector
+    flow/loss.py        fm_loss, asym_fm_loss, recover_velocity
+    flow/sampler.py     euler_sample (50-step Euler ODE)
+    train.py            training loop, domain dispatch, EMA, bf16, W&B
+    eval.py             FAD eval — handles raw + mel→vocoder pipeline
+
+  configs/
+    base_fm.yaml              Phase 1 baseline
+    asym_dct.yaml             Phase 1 asym
+    asym_pca.yaml             Phase 1 asym (PCA projector)
+    base_fm_sc09_mel.yaml     Phase 2 baseline
+    asym_dct_sc09_mel.yaml    Phase 2 asym
+    base_fm_lj_mel.yaml       Phase 3 baseline
+    asym_dct_lj_mel.yaml      Phase 3 asym
+    asym_dct_lj_mel_b.yaml    Phase 4 DiT-B stretch
+
+  scripts/
+    analyze_low_rank.py       Phase 0 variance analysis (run first)
+    download_sc09.sh          SC09 download
+    download_ljspeech.sh      LJSpeech download
+    download_hifigan.sh       HiFi-GAN pretrained weights
+    compute_pca_basis.py      precompute PCA basis for PCA projector
+    rank_ablation.py          rank sweep for Phase 1
+
+  tests/
+    test_asym_core.py         projector math + loss correctness tests
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMON ERRORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  "Missing digit dir: data/sc09/zero"
+    → Run: make data
+
+  "Missing: data/LJSpeech-1.1/wavs"
+    → Run: make data-lj
+
+  "No module named 'frechet_audio_distance'"
+    → Run: pip install frechet-audio-distance
+
+  NaN loss at step 1
+    → Check sigma_min in config (must be ≥ 1e-3)
+    → Reduce lr to 3e-5 and retry
+
+  OOM on 40GB with DiT-B
+    → Reduce batch_size to 32, set grad_accum: 4 in config
+
+  HiFi-GAN import error
+    → Ensure third_party/hifigan/ exists (make hifigan clones it)
+    → Or code falls back to Griffin-Lim automatically

@@ -1,0 +1,123 @@
+HOW TO RUN — AsymFlow Audio
+============================
+
+PAPER: arxiv.org/abs/2605.12964v1 (AsymFlow, Chen et al. 2026)
+GOAL:  Port rank-asymmetric flow matching to raw audio (SC09 speech dataset)
+HARDWARE: Single GPU, 40GB+ VRAM recommended (H100/A100)
+
+
+1. INSTALL
+----------
+pip install -e ".[dev]"
+
+
+2. DATA
+-------
+make data
+  → Downloads Speech Commands v0.02 (~2.4 GB) into data/sc09/
+  → Extracts digit classes: zero one two three four five six seven eight nine
+
+OR manually:
+  bash scripts/download_sc09.sh data/sc09
+
+
+3. SANITY TESTS (run before training)
+--------------------------------------
+make test
+  → Tests projector idempotency, symmetry, full-rank equivalence
+  → Tests that AsymFM loss == standard FM when rank == patch_size (64)
+  → Tests velocity recovery shape and correctness
+  → All tests must pass before training
+
+
+4. TRAIN BASELINE (standard flow matching)
+-------------------------------------------
+make train-fm
+  OR: python -m asymflow_audio.train configs/base_fm.yaml
+
+Config: configs/base_fm.yaml
+  - 100k steps, batch 128, bf16, AdamW lr=1e-4
+  - 1D DiT-S/64, ~33M params
+Checkpoints saved to: runs/base_fm/
+Samples saved to:     runs/base_fm/samples/
+Logs to W&B project:  asymflow-audio
+
+
+5. TRAIN ASYMFLOW (rank-asymmetric, DCT projector)
+----------------------------------------------------
+make train-asym
+  OR: python -m asymflow_audio.train configs/asym_dct.yaml
+
+Config: configs/asym_dct.yaml
+  - Same arch as baseline, rank=8 DCT projector
+  - Velocity target: u_A = P·ε − x₀  (P = DCT-II truncation, r=8)
+Checkpoints saved to: runs/asym_dct/
+
+
+5a. TRAIN ASYMFLOW with PCA projector (optional)
+-------------------------------------------------
+python scripts/compute_pca_basis.py \
+    --data_root data/sc09 --rank 8 --out data/sc09_pca_basis.pt
+
+python -m asymflow_audio.train configs/asym_pca.yaml
+
+
+6. EVALUATE (FAD score)
+------------------------
+First prepare reference WAVs from SC09 test split:
+  mkdir -p data/sc09/test_wavs
+  # copy .wav files from data/sc09/*/  (val split) into test_wavs/
+  # OR any ~2k SC09 wavs as reference
+
+Then evaluate:
+  python -m asymflow_audio.eval \
+      --ckpt runs/asym_dct/ckpt_0100000.pt \
+      --cfg configs/asym_dct.yaml \
+      --ref_dir data/sc09/test_wavs \
+      --out_dir results/asym_dct \
+      --n_samples 2048
+
+  FAD score written to: results/asym_dct/fad.json
+  Compare against:      runs/base_fm/  (same eval command, different --ckpt/--cfg)
+
+
+7. RANK ABLATION
+-----------------
+make ablation
+  OR: python scripts/rank_ablation.py \
+          --ref_dir data/sc09/test_wavs \
+          --steps 50000 \
+          --ranks 2,4,8,16,32,48
+
+Trains 6 models at reduced steps, computes FAD per rank.
+Output: results/rank_ablation.csv
+        results/rank_ablation.png
+
+
+EXPECTED RUNTIME (H100 40GB)
+------------------------------
+100k steps, batch 128, bf16:  ~8–12 hours per run
+Rank ablation (6 × 50k steps): ~24–36 hours total
+FAD eval (2048 samples):        ~10 minutes
+
+
+WANDB
+------
+Login first: wandb login
+All runs log to project: asymflow-audio
+Disable: set WANDB_MODE=disabled in env
+
+
+FILE LAYOUT
+-----------
+src/asymflow_audio/
+  data/sc09.py       — SC09 dataset loader, µ-law normalization
+  model/dit1d.py     — 1D DiT-S/64 with AdaLN-zero conditioning
+  flow/projector.py  — DCT + PCA rank-r projectors
+  flow/loss.py       — standard FM and asymmetric FM loss
+  flow/sampler.py    — 50-step Euler ODE sampler
+  train.py           — training loop
+  eval.py            — FAD evaluation
+configs/             — YAML hyperparams per experiment
+scripts/             — download, PCA precompute, rank sweep
+tests/               — correctness unit tests

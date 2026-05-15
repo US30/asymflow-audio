@@ -1,0 +1,35 @@
+name: asym_pca
+loss: asym_fm
+projector: pca
+rank: 8
+pca_basis_path: data/sc09_pca_basis.pt
+
+data:
+  root: data/sc09
+  sample_rate: 16000
+  length: 16000
+
+model:
+  patch_size: 64
+  dim: 384
+  depth: 12
+  heads: 6
+  mlp_ratio: 4
+
+train:
+  steps: 100000
+  batch_size: 128
+  grad_accum: 1
+  lr: 1e-4
+  warmup_steps: 2000
+  bf16: true
+  ema_decay: 0.9999
+  log_every: 100
+  save_every: 10000
+  sample_every: 5000
+  num_samples: 16
+  seed: 42
+
+sample:
+  steps: 50
+  sigma_min: 1e-3

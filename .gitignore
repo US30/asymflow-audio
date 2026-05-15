@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# data & checkpoints
+data/
+runs/
+results/
+*.pt
+*.pth
+*.ckpt
+
+# wandb
+wandb/
+
+# env
+.env
+*.env
+
+# jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

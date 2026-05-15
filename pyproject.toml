@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "asymflow-audio"
 version = "0.1.0"
-description = "Rank-asymmetric flow matching for raw audio waveforms (SC09)"
+description = "Rank-asymmetric flow matching for speech — mel-spectrogram and raw waveform (SC09, LJSpeech)"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.3.0",
@@ -19,6 +19,7 @@ dependencies = [
     "frechet-audio-distance>=0.0.4",
     "soundfile>=0.12.1",
     "librosa>=0.10.2",
+    "matplotlib>=3.8.0",
 ]
 
 [project.optional-dependencies]

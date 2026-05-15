@@ -1,9 +1,10 @@
 """Rank-r orthogonal projectors P = A A^T for the asym-velocity trick.
 
-DCT projector:  A = first r rows of the orthonormal DCT-II matrix (patch_size × patch_size).
-PCA projector:  A = top-r eigenvectors from PCA over training patches.
+DCTProjector:    A = first r rows of orthonormal DCT-II matrix  (1D patches)
+DCT2DProjector:  A = Kronecker(A_freq[:rf], A_time[:rt])        (2D mel patches, h×w → hw dim)
+PCAProjector:    A = top-r PCA eigenvectors from training data
 
-Both guarantee P^2 = P (idempotent) and P^T = P (symmetric).
+All guarantee P^2 = P (idempotent) and P^T = P (symmetric).
 """
 import torch
 import torch.nn as nn
@@ -71,9 +72,50 @@ class PCAProjector(nn.Module):
         return x - self.project(x)
 
 
-def build_projector(projector_type: str, patch_size: int, rank: int) -> nn.Module:
+class DCT2DProjector(nn.Module):
+    """
+    Separable 2D DCT projector for 2D patches flattened to 1D.
+
+    Patch shape (mel_bins, time_frames) → flattened dim = mel_bins * time_frames.
+    Basis: A = kron(A_freq[:rank_freq], A_time[:rank_time])
+    Total rank = rank_freq * rank_time.
+
+    Example: mel patch (80, 8), rank_freq=4, rank_time=4 → rank=16 out of 640.
+    """
+
+    def __init__(self, mel_bins: int, time_frames: int, rank_freq: int, rank_time: int):
+        super().__init__()
+        assert rank_freq <= mel_bins and rank_time <= time_frames
+        self.mel_bins = mel_bins
+        self.time_frames = time_frames
+        self.patch_size = mel_bins * time_frames
+
+        A_freq = torch.from_numpy(_dct_basis(mel_bins)[:rank_freq]).float()   # (rf, mel_bins)
+        A_time = torch.from_numpy(_dct_basis(time_frames)[:rank_time]).float() # (rt, time_frames)
+
+        # Kronecker product: (rf*rt, mel_bins*time_frames)
+        A = torch.kron(A_freq, A_time)
+        P = A.T @ A
+        self.register_buffer("A", A)
+        self.register_buffer("P", P)
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (..., patch_size) → (..., patch_size)."""
+        return x @ self.P.T
+
+    def complement(self, x: torch.Tensor) -> torch.Tensor:
+        return x - self.project(x)
+
+
+def build_projector(projector_type: str, patch_size: int, rank: int,
+                    mel_bins: int = None, time_frames: int = None,
+                    rank_freq: int = None, rank_time: int = None) -> nn.Module:
     if projector_type == "dct":
         return DCTProjector(patch_size, rank)
+    elif projector_type == "dct2d":
+        assert mel_bins and time_frames and rank_freq and rank_time, \
+            "dct2d needs mel_bins, time_frames, rank_freq, rank_time"
+        return DCT2DProjector(mel_bins, time_frames, rank_freq, rank_time)
     elif projector_type == "pca":
         return PCAProjector(patch_size, rank)
     elif projector_type is None or projector_type == "none":

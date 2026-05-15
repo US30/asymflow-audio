@@ -1,0 +1,42 @@
+# DiT-B stretch experiment — only run if Phase 3 results are clean
+name: asym_dct_lj_mel_b
+loss: asym_fm
+projector: dct2d
+mel_bins: 80
+time_frames: 8
+rank_freq: 4
+rank_time: 4
+
+data:
+  root: data/LJSpeech-1.1
+  domain: lj_mel
+  sample_rate: 16000
+  length: 16000
+  stats_path: data/ljspeech_mel_stats.pt
+  mel_bins: 80
+  time_frames: 8
+
+model:
+  patch_size: 640
+  dim: 768              # DiT-B: 768 hidden dim (~130M params vs 33M for DiT-S)
+  depth: 12
+  heads: 12
+  mlp_ratio: 4
+
+train:
+  steps: 200000
+  batch_size: 64        # smaller batch; DiT-B is ~4× heavier
+  grad_accum: 2         # effective batch = 128
+  lr: 1e-4
+  warmup_steps: 4000
+  bf16: true
+  ema_decay: 0.9999
+  log_every: 200
+  save_every: 20000
+  sample_every: 10000
+  num_samples: 16
+  seed: 42
+
+sample:
+  steps: 50
+  sigma_min: 1e-3

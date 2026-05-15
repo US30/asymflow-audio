@@ -1,295 +1,232 @@
 # AsymFlow Audio
 
-> Porting **rank-asymmetric flow matching** from images to raw audio waveforms.
+> Porting **rank-asymmetric flow matching** from images to raw audio and mel-spectrograms.
 
 Based on: [*Asymmetric Flow Models*](https://arxiv.org/abs/2605.12964) — Chen, Ackermann, Kim, Wetzstein, Guibas (Stanford + ETH, 2026)
 
----
-
-## What This Is
-
-The AsymFlow paper introduces a simple but powerful fix for flow matching in high-dimensional spaces: instead of predicting the full velocity `u = ε − x₀`, the model predicts an **asymmetric** target where noise is projected onto a low-rank subspace before being used in the velocity target. The full-rank velocity is recovered analytically at sample time — no architecture changes needed.
-
-This repo tests whether that idea transfers to **raw audio waveforms**. Speech signals live near a low-rank manifold in the DCT/frequency domain — smooth, harmonic, sparse in high frequencies. That makes them a natural fit for the asymmetric parameterization.
-
-We train a 1D Diffusion Transformer (DiT) on SC09 (spoken digit commands) and compare:
-- Standard flow matching baseline
-- AsymFlow with DCT-truncation projector (primary)
-- AsymFlow with PCA projector (secondary)
-
-Primary metric: **FAD** (Fréchet Audio Distance). Single ablation: FAD vs. projector rank `r`.
+**This project tests whether the asym-velocity trick transfers to speech** — and first proves *where* it should work (mel-spectrogram) vs. where it won't (raw waveform), then validates that empirically.
 
 ---
 
-## The Math (Quick Version)
+## The Core Idea
 
-**Standard flow matching** trains a network to predict velocity along a linear interpolant between data and noise:
+Standard flow matching trains a network to predict velocity along a linear path between data x₀ and noise ε:
 
 ```
-x_t = t · x₀ + (1 − t) · ε,    ε ~ N(0, I)
+x_t = t·x₀ + (1−t)·ε
 
-target:   u = ε − x₀
-loss:     L = E[ ‖u − û(x_t, t)‖² ]
+target:  u = ε − x₀
+loss:    L = E[ ‖u − û(x_t, t)‖² ]
 ```
 
 **AsymFlow** replaces the velocity target with:
 
 ```
-u_A = P · ε − x₀
+u_A = P·ε − x₀
 ```
 
-where `P = A Aᵀ` is a rank-r orthogonal projector (`A ∈ ℝʳˣᴰ`, rows orthonormal). This decomposes the prediction into two regimes per patch:
+where `P = AᵀA` is a rank-r orthogonal projector (`A ∈ ℝʳˣᴰ`, rows orthonormal). The prediction decomposes per patch into two regimes:
 
-| Subspace | Prediction type | Behavior |
+| Subspace | Prediction type | Why it helps |
 |---|---|---|
-| In range(P) | `P · u_A = P · u` | Standard u-prediction (stable) |
-| Orthogonal complement | `(I−P) · u_A = −(I−P) · x₀` | x₀-prediction (kills wasted noise capacity) |
+| In range(P) | Standard u-prediction | Stable training |
+| Orthogonal complement | x₀-prediction | Zeros out wasted noise capacity |
 
-**Full velocity recovery** at sample time (no architecture change):
+**Full velocity** recovered analytically at sample time — no architecture change:
 
 ```
-u = P · u_A  +  (I − P) · (x_t + u_A) / σ_t
-
-where σ_t = 1 − t
+u = P·u_A  +  (I−P)·(x_t + u_A) / σ_t      [σ_t = 1−t]
 ```
 
-**Why this helps for audio:** High-dimensional waveforms are high-rank in raw form but low-rank in frequency space. Restricting noise prediction to top-r DCT components forces the model to spend capacity on data structure (x₀-pred) rather than modeling noise in imperceptible high-frequency dimensions.
+**Why this matters for audio:** The trick only wins when data has strong low-rank structure. Raw waveforms have broadband energy (transients, sibilants). Mel-spectrograms are frequency-compressed and demonstrably low-rank. This project proves that empirically before training (Phase 0) and then validates it.
 
 ---
 
-## Architecture
+## Study Design (4 Phases)
 
-### 1D DiT-S/64 (~33M parameters)
+| Phase | What | Purpose | Compute |
+|---|---|---|---|
+| **0** | Variance-explained analysis | Prove premise, pick rank | ~10 min CPU |
+| **1** | SC09 raw waveform (FM vs AsymFM) | Baseline + expected-fail condition | ~24 H100-hrs |
+| **2** | SC09 mel-spec (FM vs AsymFM) | Primary contribution | ~16 H100-hrs |
+| **3** | LJSpeech mel-spec (FM vs AsymFM) | Generalization claim | ~40 H100-hrs |
+| **4** | LJSpeech mel-spec, DiT-B scale | Scaling behavior (stretch) | ~20 H100-hrs |
 
-```
-Input waveform  (B, 16000)
-       │
-  Patchify       patch_size=64 → 250 tokens per waveform
-       │
-  Linear proj    64 → 384 dim
-       │
-  + Positional embedding  (learned, 250 × 384)
-       │
-  ┌─── × 12 ────────────────────────────────────────────┐
-  │                                                      │
-  │   AdaLN-zero ← timestep embedding (sinusoidal MLP)  │
-  │       │                                             │
-  │   Multi-head Self-Attention  (6 heads, dim=384)     │
-  │       │                                             │
-  │   AdaLN-zero                                        │
-  │       │                                             │
-  │   MLP  (384 → 1536 → 384, GELU)                    │
-  │                                                      │
-  └──────────────────────────────────────────────────────┘
-       │
-  Final AdaLN-zero + Linear proj   384 → 64 (patch_size)
-       │
-  Unpatchify     (B, 250, 64) → (B, 16000)
-       │
-  Output velocity û(x_t, t)
-```
-
-| Hyperparameter | Value |
-|---|---|
-| Waveform length | 16000 samples (1s @ 16kHz) |
-| Patch size | 64 samples |
-| Tokens | 250 |
-| Hidden dim | 384 |
-| Depth | 12 blocks |
-| Attention heads | 6 |
-| MLP ratio | 4× |
-| Conditioning | AdaLN-zero on timestep t |
-| Parameters | ~33M |
-| Training precision | bfloat16 |
-
-### Projectors
-
-**DCT projector (primary):**
-
-Builds `A` from the first `r` rows of the orthonormal DCT-II matrix of size `patch_size × patch_size`. Physical motivation: DCT basis vectors are ordered by frequency — keeping top-r = keeping the low-frequency (smooth/harmonic) subspace.
-
-```python
-P = A^T @ A   # (patch_size × patch_size), applied per token
-```
-
-Guaranteed `P² = P` (idempotent) and `P = Pᵀ` (symmetric) by construction. No training required.
-
-**PCA projector (secondary):**
-
-Fits PCA over ~50k training patches, takes top-r eigenvectors as rows of A. More data-adaptive but requires a precompute step.
+Target venues (if positive result): **INTERSPEECH**, **ICASSP**, workshop tracks at ICML/NeurIPS.
 
 ---
 
-## Dataset: SC09
+## Architecture: 1D DiT
 
-Speech Commands v0.02, digits only (zero–nine). Standard benchmark for unconditional audio diffusion.
+Plain transformer operating on flattened patches — no architectural hacks, matching the paper's philosophy.
 
-| Property | Value |
-|---|---|
-| Classes | 10 (spoken digits 0–9) |
-| Clips | ~30k train / ~4k val |
-| Duration | 1 second per clip |
-| Sample rate | 16kHz |
-| Preprocessing | µ-law compression → [-1, 1] |
+```
+Input  (B, L)          — raw waveform or flattened mel tokens
+  │
+Patchify               — chunk into patch_size-dim tokens
+  │
+Linear proj → dim      — input embedding
+  │
++ Positional embedding (learned)
+  │
+┌── × depth ───────────────────────────────────────────────┐
+│  AdaLN-zero ← timestep MLP embedding                    │
+│  Multi-head Self-Attention                               │
+│  AdaLN-zero                                              │
+│  MLP (dim → 4×dim → dim, GELU)                         │
+└──────────────────────────────────────────────────────────┘
+  │
+Final AdaLN-zero + Linear proj → patch_size
+  │
+Unpatchify → (B, L)
+```
 
-**Reference FAD scores (from literature):**
+| Config | patch_size | dim | depth | heads | params | used for |
+|---|---|---|---|---|---|---|
+| DiT-S (default) | 64 or 640 | 384 | 12 | 6 | ~33M | Phases 1–3 |
+| DiT-B (stretch) | 640 | 768 | 12 | 12 | ~130M | Phase 4 |
 
-| Model | FAD ↓ |
-|---|---|
-| DiffWave | ~1.3 |
-| PriorGrad | ~0.5 |
-| WaveGrad | ~1.0 |
+---
+
+## Projectors
+
+### DCTProjector (1D, raw waveform)
+
+`A` = first r rows of orthonormal DCT-II matrix of size `patch_size × patch_size`.
+Physical motivation: DCT-II is the de-facto PCA of natural signals (same basis used in MP3/AAC compression). Top-r = low-frequency subspace.
+
+### DCT2DProjector (mel-spec)
+
+For mel patches of shape `(mel_bins=80, time_frames=8)`:
+
+```
+A_2D = kron(A_freq[:rank_freq], A_time[:rank_time])
+```
+
+Separable 2D DCT basis. Total rank = `rank_freq × rank_time`. Applied to the flattened 640-dim mel patch. Both dimensions sorted by frequency → projector selects the smooth/low-energy subspace of the mel patch.
+
+### PCAProjector (data-driven, secondary)
+
+Top-r PCA eigenvectors fitted from training patches. Matches the original paper. Precomputed via `scripts/compute_pca_basis.py`.
+
+---
+
+## Datasets
+
+| Dataset | Clips | Duration | SR | Domain |
+|---|---|---|---|---|
+| **SC09** | ~30k | ~8h | 16kHz | 10 spoken digit classes |
+| **LJSpeech** | 13,100 | 24h | 22→16kHz | Single speaker, real speech |
 
 ---
 
 ## Setup
 
 ### Requirements
-
 - Python ≥ 3.10
 - PyTorch ≥ 2.3 with CUDA
-- 40GB+ VRAM recommended (H100/A100)
+- 40GB+ VRAM (H100/A100) for training
 
 ### Install
-
 ```bash
 git clone https://github.com/US30/asymflow-audio
 cd asymflow-audio
-pip install -e ".[dev]"
-```
-
-### W&B (optional but recommended)
-
-```bash
-wandb login
-# All runs log to project: asymflow-audio
-# To disable: export WANDB_MODE=disabled
+make install
 ```
 
 ---
 
-## Running
+## Running: Step by Step
 
-### 1 — Download SC09
+### Step 1 — Download data
 
 ```bash
-make data
-# OR: bash scripts/download_sc09.sh data/sc09
+make data        # SC09 (~2.4 GB)
+make data-lj     # LJSpeech (~2.6 GB)
+make hifigan     # HiFi-GAN pretrained vocoder (~50 MB)
 ```
 
-Downloads ~2.4 GB. Extracts the 10 digit subdirs into `data/sc09/`.
+### Step 2 — Run variance analysis (Phase 0, required)
 
-### 2 — Run correctness tests
+```bash
+make analyze
+```
+
+Runs `scripts/analyze_low_rank.py` on SC09 and LJSpeech patches.
+Outputs `results/variance_explained.png` — the motivating figure.
+
+**Read the output before training.** The elbow ranks tell you what to set for `rank_freq` and `rank_time` in the asym configs.
+
+### Step 3 — Run tests
 
 ```bash
 make test
 ```
 
-Verifies before burning GPU time:
-- `P² = P` (projector idempotent)
-- `P = Pᵀ` (projector symmetric)
-- `P·x + (I−P)·x = x` (complement is correct)
-- `r = patch_size` → AsymFM loss **identical** to standard FM loss
-- Velocity recovery shape and full-rank identity
-- No NaN/Inf on synthetic sinusoid input
+Verifies projector math (idempotency, symmetry, full-rank identity) for both 1D and 2D projectors. **All tests must pass.**
 
-**All tests must pass before training.**
-
-### 3 — Train baseline (standard FM)
+### Step 4 — Phase 1: SC09 raw waveform
 
 ```bash
-make train-fm
-# OR: python -m asymflow_audio.train configs/base_fm.yaml
+make train-fm      # baseline FM, ~12 hrs
+make train-asym    # AsymFM + DCT r=8, ~12 hrs
+make ablation      # rank sweep r∈{2,4,8,16,32,48}, ~24 hrs
 ```
 
-### 4 — Train AsymFlow (DCT projector, rank=8)
+### Step 5 — Phase 2: SC09 mel-spectrogram (primary experiment)
 
 ```bash
-make train-asym
-# OR: python -m asymflow_audio.train configs/asym_dct.yaml
+make train-fm-mel      # baseline FM on mel, ~8 hrs
+make train-asym-mel    # AsymFM + DCT2D (rank=4×4=16), ~8 hrs
 ```
 
-### 4a — Train AsymFlow (PCA projector, optional)
+### Step 6 — Phase 3: LJSpeech mel-spectrogram (generalization)
 
 ```bash
-make pca-basis   # precompute PCA from training data (~5 min)
-python -m asymflow_audio.train configs/asym_pca.yaml
+make train-fm-lj       # baseline FM on LJSpeech mel, ~20 hrs
+make train-asym-lj     # AsymFM + DCT2D on LJSpeech, ~20 hrs
 ```
 
-### Training details
-
-| Setting | Value |
-|---|---|
-| Steps | 100k |
-| Batch size | 128 |
-| Gradient accumulation | 1 |
-| Optimizer | AdamW, lr=1e-4, wd=1e-4 |
-| LR warmup | 2000 steps |
-| EMA decay | 0.9999 |
-| Precision | bfloat16 |
-| Grad clip | 1.0 |
-| Sampler (eval) | 50-step Euler ODE |
-
-Checkpoints saved every 10k steps to `runs/<name>/ckpt_XXXXXXX.pt`.  
-Audio samples saved every 5k steps to `runs/<name>/samples/step_XXXXXXX/`.
-
-### 5 — Evaluate (FAD)
-
-Prepare reference WAVs from the SC09 val split:
+### Step 7 — Phase 4: DiT-B scale (stretch)
 
 ```bash
-mkdir -p data/sc09/test_wavs
-# copy ~2k .wav files from data/sc09/*/ into test_wavs/
+make train-asym-lj-b   # only if Phase 3 shows clean improvement
 ```
 
-Then evaluate any checkpoint:
+### Evaluate (FAD)
 
 ```bash
-# Baseline
 python -m asymflow_audio.eval \
-    --ckpt runs/base_fm/ckpt_0100000.pt \
-    --cfg configs/base_fm.yaml \
+    --ckpt runs/asym_dct_sc09_mel/ckpt_0100000.pt \
+    --cfg configs/asym_dct_sc09_mel.yaml \
     --ref_dir data/sc09/test_wavs \
-    --out_dir results/base_fm \
+    --out_dir results/asym_sc09_mel \
     --n_samples 2048
-
-# AsymFM
-python -m asymflow_audio.eval \
-    --ckpt runs/asym_dct/ckpt_0100000.pt \
-    --cfg configs/asym_dct.yaml \
-    --ref_dir data/sc09/test_wavs \
-    --out_dir results/asym_dct \
-    --n_samples 2048
+# FAD written to results/asym_sc09_mel/fad.json
 ```
 
-FAD score written to `results/<name>/fad.json`.
-
-### 6 — Rank ablation
-
-Trains 6 models at 50k steps each (rank r ∈ {2, 4, 8, 16, 32, 48}) and plots FAD vs r:
-
-```bash
-make ablation
-# OR:
-python scripts/rank_ablation.py \
-    --ref_dir data/sc09/test_wavs \
-    --steps 50000 \
-    --ranks 2,4,8,16,32,48
-```
-
-Output:
-- `results/rank_ablation.csv`
-- `results/rank_ablation.png` — U-shaped curve expected, minimum around r=8–16
+**For mel-spec models:** both generated and reference audio pass through the vocoder pipeline, so the vocoder's quality floor cancels out in the FAD comparison — fair evaluation by design.
 
 ---
 
-## Expected Runtime (H100 40GB)
+## Expected Results
 
-| Task | Time |
+### Cross-domain table (to be filled after training)
+
+| Dataset | Domain | Model | FM FAD ↓ | AsymFM FAD ↓ | Δ |
+|---|---|---|---|---|---|
+| SC09 | raw waveform | DiT-S | — | — | predicted: small |
+| SC09 | mel-spec | DiT-S | — | — | predicted: clear win |
+| LJSpeech | mel-spec | DiT-S | — | — | predicted: clear win |
+| LJSpeech | mel-spec | DiT-B | — | — | predicted: larger win |
+
+### Reference FAD (raw waveform, from literature)
+
+| Model | SC09 FAD ↓ |
 |---|---|
-| 100k steps, batch 128, bf16 | ~8–12 hours |
-| FAD eval (2048 samples) | ~10 minutes |
-| Rank ablation (6 × 50k steps) | ~24–36 hours total |
+| DiffWave | ~1.3 |
+| PriorGrad | ~0.5 |
+| WaveGrad | ~1.0 |
 
 ---
 
@@ -298,65 +235,67 @@ Output:
 ```
 asymflow-audio/
 ├── README.md
-├── HOW_TO_RUN.txt          quick reference for server
-├── Makefile                common commands
-├── pyproject.toml          package + deps (uv/pip)
+├── HOW_TO_RUN.txt              quick-start reference
+├── Makefile                    all commands
+├── pyproject.toml
 │
 ├── configs/
-│   ├── base_fm.yaml        standard flow matching baseline
-│   ├── asym_dct.yaml       AsymFM + DCT projector, rank=8
-│   └── asym_pca.yaml       AsymFM + PCA projector, rank=8
+│   ├── base_fm.yaml            SC09 raw — baseline FM
+│   ├── asym_dct.yaml           SC09 raw — AsymFM + DCT r=8
+│   ├── asym_pca.yaml           SC09 raw — AsymFM + PCA r=8
+│   ├── base_fm_sc09_mel.yaml   SC09 mel — baseline FM       [Phase 2]
+│   ├── asym_dct_sc09_mel.yaml  SC09 mel — AsymFM + DCT2D   [Phase 2]
+│   ├── base_fm_lj_mel.yaml     LJSpeech mel — baseline FM  [Phase 3]
+│   ├── asym_dct_lj_mel.yaml    LJSpeech mel — AsymFM       [Phase 3]
+│   └── asym_dct_lj_mel_b.yaml  LJSpeech mel — DiT-B        [Phase 4]
 │
 ├── src/asymflow_audio/
 │   ├── data/
-│   │   └── sc09.py         dataset loader, µ-law encode/decode, DataLoader builder
+│   │   ├── sc09.py             SC09 raw waveform loader + µ-law encode/decode
+│   │   ├── melspec.py          MelSpecExtractor, MelNormalizer, HiFi-GAN vocoder
+│   │   ├── sc09_mel.py         SC09 mel-spec dataset (12 tokens × 640-dim)
+│   │   └── ljspeech.py         LJSpeech raw + mel datasets (25 tokens × 640-dim)
 │   ├── model/
-│   │   └── dit1d.py        1D DiT: patch embed, positional embed, DiTBlock,
-│   │                         AdaLN-zero, FinalLayer, TimestepEmbedder
+│   │   └── dit1d.py            1D DiT: TimestepEmbedder, DiTBlock, AdaLN-zero, FinalLayer
 │   ├── flow/
-│   │   ├── projector.py    DCTProjector, PCAProjector — both expose .project()
-│   │   │                     and .complement(); P = A^T A computed once at init
-│   │   ├── loss.py         fm_loss(), asym_fm_loss(), recover_velocity(),
-│   │   │                     sample_xt(), linear_schedule()
-│   │   └── sampler.py      euler_sample() — works for both FM and AsymFM
-│   ├── train.py            training loop: EMA, grad accum, bf16, W&B logging,
-│   │                         checkpoint saving, audio sample generation
-│   └── eval.py             generate samples → compute FAD via VGGish embeddings
+│   │   ├── projector.py        DCTProjector, DCT2DProjector, PCAProjector
+│   │   ├── loss.py             fm_loss, asym_fm_loss, recover_velocity, sample_xt
+│   │   └── sampler.py          euler_sample (50-step Euler ODE)
+│   ├── train.py                training loop: EMA, bf16, grad accum, W&B, multi-domain
+│   └── eval.py                 FAD eval with mel→vocoder pipeline for fair comparison
 │
 ├── scripts/
-│   ├── download_sc09.sh    pulls Speech Commands v0.02, extracts digit classes
-│   ├── compute_pca_basis.py fits PCA over training patches, saves A matrix
-│   └── rank_ablation.py    rank sweep: train → eval → CSV + plot
+│   ├── analyze_low_rank.py     Phase 0: PCA variance curves (run first!)
+│   ├── download_sc09.sh
+│   ├── download_ljspeech.sh
+│   ├── download_hifigan.sh
+│   ├── compute_pca_basis.py
+│   └── rank_ablation.py        rank sweep r∈{2,4,8,16,32,48}
 │
 └── tests/
-    └── test_asym_core.py   projector properties, loss equivalence, velocity
-                              recovery, synthetic sinusoid sanity check
+    └── test_asym_core.py       correctness tests: 1D + 2D projectors, loss equivalence,
+                                  velocity recovery, synthetic sanity check
 ```
 
 ---
 
 ## Key Design Decisions
 
-**Why DCT as the projector?**  
-The paper uses PCA computed from training data. For audio, DCT-II is essentially PCA of natural speech signals (this is why MP3/AAC compression works). Using DCT makes the projector parameter-free, physically interpretable, and avoids a precompute dependency.
+**DCT2D projector via Kronecker product.** For mel patches `(80, 8)`, the separable 2D DCT basis is `kron(A_freq, A_time)`. This is equivalent to applying 1D DCT along each axis and thresholding. Advantage: parameter-free, physically motivated, no training or precomputation. Rows are orthonormal → `P = AᵀA` is exact.
 
-**Why patch-wise projection?**  
-Matches the paper exactly. Each 64-sample patch (one token in the DiT) gets the projector applied independently. This is also consistent with how DCT is applied in audio codecs — per-frame, not globally.
+**Patch size = 640 for mel.** One token = 80 mel bins × 8 time frames = 80ms at 16kHz. Large enough to capture formant structure; small enough that the low-rank argument holds per-patch.
 
-**Why skip the variance-reduced loss?**  
-Paper Eq. 7 + perceptual correction (Eq. 18) are specific to finetuning from a pretrained latent model. From-scratch training with the base AsymFM loss (Eq. 4) is cleaner and sufficient for this experiment.
+**Vocoder round-trip for fair FAD.** For mel-spec models, both generated and reference audio pass through `mel → HiFi-GAN → wav → VGGish`. The vocoder's quality floor cancels. The FAD measures the model's generative quality above that floor, not the vocoder quality itself.
 
-**Why σ_t clamping?**  
-The velocity recovery formula divides by σ_t = (1−t). Near t=1 this explodes. Clamping at `σ_min = 1e-3` keeps sampling stable — standard practice in flow models.
+**σ_t clamping.** Velocity recovery divides by `σ_t = 1−t`. Clamped at `1e-3` to prevent explosion near `t=1`. Standard in flow models.
 
 ---
 
-## Risks & Known Limitations
+## Risks
 
-- **Audio may have more high-frequency content than natural images.** Transients, sibilants (s/sh sounds), stop consonants have energy across the full DCT spectrum. The x₀-prediction regime (orthogonal complement) may be less stable for audio than for images. Monitor for artifacts in generated samples.
-- **No vocoder needed** — this is direct waveform generation. But µ-law compression is lossy at high frequencies; may limit quality ceiling.
-- **FAD only.** No Inception Score in MVP (would require training an SC09 classifier). FAD is the standard metric for this benchmark.
-- **Unconditional generation only.** No class label conditioning. The architecture supports it (just pass class embedding through AdaLN-zero alongside timestep) but that is out of scope.
+- **Vocoder mismatch.** HiFi-GAN was trained at 22.05kHz; we use 16kHz. Mitigated by the round-trip eval design — both sides go through the same vocoder, so the mismatch is symmetric.
+- **Raw waveform may not show improvement.** This is expected and informative — the variance analysis (Phase 0) predicts this and explains why.
+- **Compute overrun.** Phase 4 is explicitly stretch — skip if Phase 3 takes longer than ~40 GPU-hours.
 
 ---
 
@@ -367,7 +306,8 @@ If you use this work, please cite the original AsymFlow paper:
 ```bibtex
 @article{chen2026asymflow,
   title     = {Asymmetric Flow Models},
-  author    = {Chen, Hansheng and Ackermann, Jan and Kim, Minseo and Wetzstein, Gordon and Guibas, Leonidas},
+  author    = {Chen, Hansheng and Ackermann, Jan and Kim, Minseo and
+               Wetzstein, Gordon and Guibas, Leonidas},
   journal   = {arXiv preprint arXiv:2605.12964},
   year      = {2026}
 }

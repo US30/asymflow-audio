@@ -1,0 +1,38 @@
+name: base_fm_sc09_mel
+loss: fm
+projector: null
+rank: null
+
+data:
+  root: data/sc09
+  domain: sc09_mel
+  sample_rate: 16000
+  length: 7680          # 12 tokens × 640 dims (80 mel × 8 time frames)
+  stats_path: data/sc09_mel_stats.pt
+  mel_bins: 80
+  time_frames: 8
+
+model:
+  patch_size: 640       # each token is (80 mel × 8 time) = 640
+  dim: 384
+  depth: 12
+  heads: 6
+  mlp_ratio: 4
+
+train:
+  steps: 100000
+  batch_size: 128
+  grad_accum: 1
+  lr: 1e-4
+  warmup_steps: 2000
+  bf16: true
+  ema_decay: 0.9999
+  log_every: 100
+  save_every: 10000
+  sample_every: 5000
+  num_samples: 16
+  seed: 42
+
+sample:
+  steps: 50
+  sigma_min: 1e-3

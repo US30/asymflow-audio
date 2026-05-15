@@ -3,6 +3,10 @@
 Usage:
     python -m asymflow_audio.train configs/base_fm.yaml
     python -m asymflow_audio.train configs/asym_dct.yaml
+    python -m asymflow_audio.train configs/asym_dct_sc09_mel.yaml
+    python -m asymflow_audio.train configs/asym_dct_lj_mel.yaml
+
+cfg.data.domain: "raw_waveform" | "sc09_mel" | "lj_mel"
 """
 import copy
 import os
@@ -16,8 +20,10 @@ from torch.cuda.amp import GradScaler
 import wandb
 
 from .data.sc09 import build_loaders, mu_law_decode
+from .data.sc09_mel import build_mel_loaders as build_sc09_mel_loaders
+from .data.ljspeech import build_lj_loaders
 from .model.dit1d import build_model
-from .flow.projector import build_projector, PCAProjector
+from .flow.projector import build_projector, PCAProjector, DCT2DProjector
 from .flow.loss import fm_loss, asym_fm_loss
 from .flow.sampler import euler_sample
 
@@ -42,8 +48,16 @@ def train(cfg_path: str):
 
     run = wandb.init(project="asymflow-audio", name=cfg.name, config=OmegaConf.to_container(cfg))
 
-    # Data
-    train_loader, val_loader = build_loaders(cfg)
+    # Data — dispatch on domain
+    domain = cfg.data.get("domain", "raw_waveform")
+    if domain == "raw_waveform":
+        train_loader, val_loader = build_loaders(cfg)
+    elif domain == "sc09_mel":
+        train_loader, val_loader = build_sc09_mel_loaders(cfg)
+    elif domain == "lj_mel":
+        train_loader, val_loader = build_lj_loaders(cfg)
+    else:
+        raise ValueError(f"Unknown domain: {domain}")
     train_iter = iter(train_loader)
 
     # Model
@@ -64,7 +78,19 @@ def train(cfg_path: str):
     # Projector
     projector = None
     if cfg.projector is not None and cfg.projector != "none":
-        projector = build_projector(cfg.projector, cfg.model.patch_size, cfg.rank).to(device)
+        if cfg.projector == "dct2d":
+            projector = build_projector(
+                "dct2d",
+                patch_size=cfg.model.patch_size,
+                rank=cfg.get("rank", None),
+                mel_bins=cfg.get("mel_bins", 80),
+                time_frames=cfg.get("time_frames", 8),
+                rank_freq=cfg.get("rank_freq", 4),
+                rank_time=cfg.get("rank_time", 4),
+            ).to(device)
+        else:
+            projector = build_projector(cfg.projector, cfg.model.patch_size,
+                                        cfg.get("rank", 8)).to(device)
         if isinstance(projector, PCAProjector):
             _fit_pca(projector, train_loader, device, cfg)
 
@@ -85,6 +111,11 @@ def train(cfg_path: str):
             except StopIteration:
                 train_iter = iter(train_loader)
                 x0 = next(train_iter)
+            # mel datasets return (B, n_tokens, patch_dim); flatten token dim for DiT
+            # raw waveform returns (B, L); keep as is
+            if x0.dim() == 3:
+                B, N, D = x0.shape
+                x0 = x0.reshape(B, N * D)
             x0 = x0.to(device)
 
             with torch.autocast(device_type="cuda", dtype=dtype, enabled=cfg.train.bf16):
@@ -139,16 +170,50 @@ def _save_samples(ema, projector, patch_size, cfg, device, dtype, out_dir, step,
             device=device,
         )
 
-    # Decode mu-law → waveform
-    x = mu_law_decode(x.float().cpu())
+    domain = cfg.data.get("domain", "raw_waveform")
+    if domain == "raw_waveform":
+        wavs = mu_law_decode(x.float().cpu())
+    else:
+        wavs = _mel_to_wav(x.float().cpu(), cfg, out_dir)
 
     audio_list = []
-    for i, wav in enumerate(x):
+    for i, wav in enumerate(wavs):
         path = str(samples_dir / f"{i:03d}.wav")
         sf.write(path, wav.numpy(), samplerate=cfg.data.sample_rate)
         audio_list.append(wandb.Audio(path, sample_rate=cfg.data.sample_rate, caption=f"{i}"))
-
     run.log({"samples": audio_list}, step=step)
+
+
+def _mel_to_wav(x: torch.Tensor, cfg, out_dir: Path) -> torch.Tensor:
+    """
+    x: (B, n_tokens * patch_dim) generated mel sequence → (B, L) audio via vocoder.
+    Falls back to Griffin-Lim if HiFi-GAN weights not found.
+    """
+    from einops import rearrange
+    from .data.melspec import MelNormalizer, griffin_lim_invert
+
+    mel_bins = cfg.get("mel_bins", 80)
+    time_frames = cfg.get("time_frames", 8)
+
+    # Reshape: (B, N*D) → (B, mel_bins, T)
+    x = rearrange(x, 'b (n m t) -> b m (n t)', m=mel_bins, t=time_frames)
+
+    # Denormalize
+    stats_path = cfg.data.get("stats_path", None)
+    if stats_path and Path(stats_path).exists():
+        norm = MelNormalizer.load(stats_path)
+        x = norm.denormalize(x)
+
+    # Try HiFi-GAN, fallback Griffin-Lim
+    hifigan_ckpt = Path("data/hifigan/generator_universal.pth")
+    if hifigan_ckpt.exists():
+        from .data.melspec import HiFiGANVocoder
+        vocoder = HiFiGANVocoder.load_default()
+        wavs = vocoder(x)
+    else:
+        wavs = torch.stack([griffin_lim_invert(x[i]) for i in range(x.shape[0])])
+
+    return wavs.cpu()
 
 
 def _fit_pca(projector, train_loader, device, cfg):

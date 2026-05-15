@@ -5,10 +5,10 @@ dist/
 build/
 .eggs/
 
-# data & checkpoints
-data/
-runs/
-results/
+# data & checkpoints (top-level only)
+/data/
+/runs/
+/results/
 *.pt
 *.pth
 *.ckpt
